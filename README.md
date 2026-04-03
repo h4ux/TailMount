@@ -47,7 +47,7 @@ Download the latest DMG from the [Releases](../../releases/latest) page.
 ### Build
 
 ```bash
-git clone https://github.com/AlenBadworworwor/TailMount.git
+git clone https://github.com/h4ux/TailMount.git
 cd TailMount
 xcodegen generate
 xcodebuild -project TailMount.xcodeproj -scheme TailMount -configuration Release build
