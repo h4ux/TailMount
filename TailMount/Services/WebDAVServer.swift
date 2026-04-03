@@ -188,6 +188,8 @@ private final class WebDAVHandler: ChannelInboundHandler, @unchecked Sendable {
         let encodedURI = uri.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? uri
         let resourceType = entry.isDirectory ? "<D:collection/>" : ""
         let rfc1123 = rfc1123Formatter.string(from: entry.modified)
+        let contentType = entry.isDirectory ? "httpd/unix-directory" : mimeType(for: entry.name)
+        let etag = "\"\(entry.size)-\(Int(entry.modified.timeIntervalSince1970))\""
 
         return """
           <D:response>
@@ -196,7 +198,9 @@ private final class WebDAVHandler: ChannelInboundHandler, @unchecked Sendable {
               <D:prop>
                 <D:displayname>\(xmlEscape(entry.name))</D:displayname>
                 <D:getcontentlength>\(entry.size)</D:getcontentlength>
+                <D:getcontenttype>\(contentType)</D:getcontenttype>
                 <D:getlastmodified>\(rfc1123)</D:getlastmodified>
+                <D:getetag>\(etag)</D:getetag>
                 <D:resourcetype>\(resourceType)</D:resourcetype>
                 <D:creationdate>\(iso8601Formatter.string(from: entry.modified))</D:creationdate>
               </D:prop>
@@ -209,13 +213,29 @@ private final class WebDAVHandler: ChannelInboundHandler, @unchecked Sendable {
     // MARK: - GET
 
     static func handleGet(remotePath: String, sftp: SFTPBridge, channel: Channel) async throws {
+        let entry = try await sftp.stat(at: remotePath)
+
+        // Directories: return a simple HTML listing (macOS WebDAV client needs this)
+        if entry.isDirectory {
+            let children = try await sftp.listDirectory(at: remotePath)
+            let html = children.map { "<li>\($0.name)</li>" }.joined()
+            sendResponse(
+                channel: channel,
+                status: .ok,
+                headers: [("Content-Type", "text/html; charset=utf-8")],
+                bodyString: "<html><body><ul>\(html)</ul></body></html>"
+            )
+            return
+        }
+
         let data = try await sftp.readFile(at: remotePath)
         sendResponse(
             channel: channel,
             status: .ok,
             headers: [
-                ("Content-Type", "application/octet-stream"),
+                ("Content-Type", mimeType(for: entry.name)),
                 ("Content-Length", "\(data.count)"),
+                ("ETag", "\"\(data.count)-\(Int(entry.modified.timeIntervalSince1970))\""),
             ],
             bodyData: data
         )
@@ -229,8 +249,9 @@ private final class WebDAVHandler: ChannelInboundHandler, @unchecked Sendable {
             channel: channel,
             status: .ok,
             headers: [
-                ("Content-Type", entry.isDirectory ? "httpd/unix-directory" : "application/octet-stream"),
+                ("Content-Type", entry.isDirectory ? "httpd/unix-directory" : mimeType(for: entry.name)),
                 ("Content-Length", "\(entry.size)"),
+                ("ETag", "\"\(entry.size)-\(Int(entry.modified.timeIntervalSince1970))\""),
             ]
         )
     }
@@ -334,5 +355,25 @@ private final class WebDAVHandler: ChannelInboundHandler, @unchecked Sendable {
             .replacingOccurrences(of: "<", with: "&lt;")
             .replacingOccurrences(of: ">", with: "&gt;")
             .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+
+    static func mimeType(for filename: String) -> String {
+        let ext = (filename as NSString).pathExtension.lowercased()
+        switch ext {
+        case "txt": return "text/plain"
+        case "html", "htm": return "text/html"
+        case "css": return "text/css"
+        case "js": return "application/javascript"
+        case "json": return "application/json"
+        case "xml": return "application/xml"
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "pdf": return "application/pdf"
+        case "zip": return "application/zip"
+        case "mp4": return "video/mp4"
+        case "mp3": return "audio/mpeg"
+        default: return "application/octet-stream"
+        }
     }
 }

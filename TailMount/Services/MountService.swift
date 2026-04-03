@@ -10,6 +10,7 @@ final class MountService {
         let webDAVServer: WebDAVServer
         let mountPoint: String
         let port: Int
+        let hostsAlias: String
     }
 
     func mount(node: TailscaleNode, at _: String, username: String) async throws {
@@ -24,21 +25,28 @@ final class MountService {
         try await webDAV.start()
         let port = webDAV.port
 
-        // 3. Mount at /Volumes/<name> so Finder shows the server name.
-        //    /Volumes is root-owned, so we create the dir + mount via a single
-        //    privilege-escalated shell command.
+        // 3. Prepare mount point in /Volumes and hosts alias
         let volumeName = node.displayName
         let mountPoint = "/Volumes/\(volumeName)"
-        let mountURL = "http://127.0.0.1:\(port)/"
+        // Hosts alias: used so Finder sidebar shows the server name instead of 127.0.0.1
+        let hostsAlias = "tailmount-\(volumeName)"
+            .replacingOccurrences(of: " ", with: "-")
+            .lowercased()
 
-        try await mountWithPrivileges(url: mountURL, at: mountPoint, volumeName: volumeName)
+        // Single admin prompt: create mount dir + add hosts entry
+        try await setupMount(mountPoint: mountPoint, hostsAlias: hostsAlias)
 
-        // 4. Track session
+        // 4. Mount using the hostname alias
+        let mountURL = "http://\(hostsAlias):\(port)/"
+        try mountWebDAV(url: mountURL, at: mountPoint, volumeName: volumeName)
+
+        // 5. Track session
         sessions[node.dnsName] = MountSession(
             sftpBridge: sftpBridge,
             webDAVServer: webDAV,
             mountPoint: mountPoint,
-            port: port
+            port: port,
+            hostsAlias: hostsAlias
         )
     }
 
@@ -48,6 +56,7 @@ final class MountService {
         try? await session.webDAVServer.stop()
         try? await session.sftpBridge.disconnect()
         try? FileManager.default.removeItem(atPath: session.mountPoint)
+        removeHostsAlias(session.hostsAlias)
     }
 
     func isMounted(at mountPoint: String) -> Bool {
@@ -73,46 +82,68 @@ final class MountService {
             try? await session.webDAVServer.stop()
             try? await session.sftpBridge.disconnect()
             try? FileManager.default.removeItem(atPath: session.mountPoint)
+            removeHostsAlias(session.hostsAlias)
             sessions.removeValue(forKey: dnsName)
         }
     }
 
     // MARK: - Private
 
-    /// Create mount point in /Volumes and mount via a single admin-privileged command.
-    /// macOS will show a one-time admin prompt the first time.
-    private func mountWithPrivileges(url: String, at mountPoint: String, volumeName: String) async throws {
-        // Escape single quotes for shell
-        let safeMountPoint = mountPoint.replacingOccurrences(of: "'", with: "'\\''")
-        let safeVolumeName = volumeName.replacingOccurrences(of: "'", with: "'\\''")
-        let safeURL = url.replacingOccurrences(of: "'", with: "'\\''")
+    /// Create mount point in /Volumes and add a hosts entry, with a single admin prompt.
+    private func setupMount(mountPoint: String, hostsAlias: String) async throws {
+        let safePath = mountPoint.replacingOccurrences(of: "'", with: "'\\''")
 
-        let shellCmd = """
-        mkdir -p '\(safeMountPoint)' && /sbin/mount_webdav -s -S -v '\(safeVolumeName)' '\(safeURL)' '\(safeMountPoint)'
-        """
+        // Clean stale mount point
+        if FileManager.default.fileExists(atPath: mountPoint) && !isMounted(at: mountPoint) {
+            try? FileManager.default.removeItem(atPath: mountPoint)
+        }
 
-        // First try without privilege escalation (works if user has write access)
+        let uid = getuid()
+        let gid = getgid()
+
+        // Single admin command: create dir + add hosts alias
+        var cmds: [String] = []
+        if !FileManager.default.fileExists(atPath: mountPoint) {
+            cmds.append("mkdir -p '\(safePath)' && chown \(uid):\(gid) '\(safePath)'")
+        }
+        // Add hosts entry if not already there
+        cmds.append("grep -q '\(hostsAlias)' /etc/hosts || echo '127.0.0.1 \(hostsAlias)' >> /etc/hosts")
+
+        let cmd = cmds.joined(separator: " && ")
+        let script = NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges")
+        var errorDict: NSDictionary?
+        script?.executeAndReturnError(&errorDict)
+
+        if let error = errorDict {
+            let msg = error[NSAppleScript.errorMessage] as? String ?? "Setup failed"
+            throw MountError.mountFailed(msg)
+        }
+    }
+
+    /// Remove the hosts alias (best-effort, no admin prompt).
+    private func removeHostsAlias(_ alias: String) {
+        let cmd = "sed -i '' '/\\b\(alias)\\b/d' /etc/hosts"
+        let script = NSAppleScript(source: "do shell script \"\(cmd)\" with administrator privileges")
+        script?.executeAndReturnError(nil)
+    }
+
+    private func mountWebDAV(url: String, at mountPoint: String, volumeName: String) throws {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", shellCmd]
-        let errPipe = Pipe()
-        process.standardError = errPipe
+        process.executableURL = URL(fileURLWithPath: "/sbin/mount_webdav")
+        process.arguments = ["-s", "-S", "-v", volumeName, url, mountPoint]
+
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
         process.standardOutput = Pipe()
 
         try process.run()
         process.waitUntilExit()
 
-        if process.terminationStatus == 0 { return }
-
-        // Fall back to admin privilege escalation via AppleScript
-        let script = "do shell script \"\(shellCmd.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\" with administrator privileges"
-        let appleScript = NSAppleScript(source: script)
-        var errorDict: NSDictionary?
-        appleScript?.executeAndReturnError(&errorDict)
-
-        if let error = errorDict {
-            let msg = error[NSAppleScript.errorMessage] as? String ?? "Mount failed"
-            throw MountError.mountFailed(msg)
+        if process.terminationStatus != 0 {
+            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            let errorMsg = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "exit \(process.terminationStatus)"
+            throw MountError.mountFailed(errorMsg)
         }
     }
 
