@@ -1,0 +1,18 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+xcuserdata/
+
+# Generated Xcode project (regenerate with: xcodegen generate)
+TailMount.xcodeproj
+
+# macOS
+.DS_Store
+
+# Debug logs
+TailMount-debug.log
+
+# SPM
+.build/
